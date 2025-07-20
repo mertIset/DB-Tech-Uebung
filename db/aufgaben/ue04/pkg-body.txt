@@ -1,23 +1,164 @@
 create or replace package body versicherungsservice as
 
-  procedure test(
-    p_vertrags_id vertrag.id%type
-  ) as
-  begin
-    dbms_output.put_line('test');
-    dbms_output.put_line(p_vertrags_id);
-  end test;
-
-  -----------------------------------------------------------------------------
-  -- transfer_sample
-  -----------------------------------------------------------------------------
   procedure create_deckung (
     p_vertrags_id vertrag.id%type,
     p_deckungsart_id deckungsart.id%type,
     p_deckungsbetrag deckung.deckungsbetrag%type
   ) as
+
+    -- Variablen für Prüfungen
+    v_count number;
+    v_produkt_id produkt.id%type;
+    v_versicherungsbeginn vertrag.versicherungsbeginn%type;
+    v_geburtsdatum kunde.geburtsdatum%type;
+    v_alter number;
+    v_regel_betrag ablehnungsregel.r_betrag%type;
+    v_regel_alter ablehnungsregel.r_alter%type;
+    v_betrag_grenze number;
+    v_alter_grenze number;
+    v_alter_verletzt boolean := false;
+    v_betrag_verletzt boolean := false;
+
+    -- Cursor für Ablehnungsregeln
+    cursor c_regeln is
+      select r_betrag, r_alter
+      from ablehnungsregel
+      where deckungsart_fk = p_deckungsart_id;
+
   begin
-    test(p_vertrags_id);
+    -- 1. Prüfen, ob Vertrag existiert
+    select count(*)
+    into v_count
+    from vertrag
+    where id = p_vertrags_id;
+
+    if v_count = 0 then
+      raise_application_error(-20002, 'Vertrag existiert nicht: ' || p_vertrags_id);
+    end if;
+
+    -- 2. Prüfen, ob Deckungsart existiert
+    select count(*)
+    into v_count
+    from deckungsart
+    where id = p_deckungsart_id;
+
+    if v_count = 0 then
+      raise_application_error(-20003, 'Deckungsart existiert nicht: ' || p_deckungsart_id);
+    end if;
+
+    -- 3. Prüfen, ob Deckungsart zum Produkt des Vertrags passt
+    select v.produkt_fk
+    into v_produkt_id
+    from vertrag v
+    where v.id = p_vertrags_id;
+
+    select count(*)
+    into v_count
+    from deckungsart d
+    where d.id = p_deckungsart_id
+    and d.produkt_fk = v_produkt_id;
+
+    if v_count = 0 then
+      raise_application_error(-20005, 'Deckungsart passt nicht zu Produkt');
+    end if;
+
+    -- 4. Prüfen, ob Deckungsbetrag gültig ist
+    select count(*)
+    into v_count
+    from deckungsbetrag
+    where deckungsart_fk = p_deckungsart_id
+    and deckungsbetrag = p_deckungsbetrag;
+
+    if v_count = 0 then
+      raise_application_error(-20004, 'Ungültiger Deckungsbetrag: ' || p_deckungsbetrag);
+    end if;
+
+    -- 5. Versicherungsbeginn ermitteln für Deckungspreisvalidierung
+    select versicherungsbeginn
+    into v_versicherungsbeginn
+    from vertrag
+    where id = p_vertrags_id;
+
+    -- 6. Prüfen, ob Deckungspreis für den Zeitraum existiert
+    select count(*)
+    into v_count
+    from deckungsbetrag db
+    join deckungspreis dp on dp.deckungsbetrag_fk = db.id
+    where db.deckungsart_fk = p_deckungsart_id
+    and db.deckungsbetrag = p_deckungsbetrag
+    and dp.gueltig_von <= v_versicherungsbeginn
+    and dp.gueltig_bis >= v_versicherungsbeginn;
+
+    if v_count = 0 then
+      raise_application_error(-20007, 'Deckungspreis nicht vorhanden für Betrag: ' || p_deckungsbetrag);
+    end if;
+
+    -- 7. Geburtsdatum des Kunden ermitteln
+    select k.geburtsdatum
+    into v_geburtsdatum
+    from vertrag v
+    join kunde k on v.kunde_fk = k.id
+    where v.id = p_vertrags_id;
+
+    -- 8. Alter zum Versicherungsbeginn berechnen
+    v_alter := extract(year from v_versicherungsbeginn) - extract(year from v_geburtsdatum);
+
+    -- Wenn Geburtstag noch nicht erreicht, Alter um 1 reduzieren
+    if (extract(month from v_versicherungsbeginn) < extract(month from v_geburtsdatum)) or
+       (extract(month from v_versicherungsbeginn) = extract(month from v_geburtsdatum) and
+        extract(day from v_versicherungsbeginn) < extract(day from v_geburtsdatum)) then
+      v_alter := v_alter - 1;
+    end if;
+
+    -- 9. Ablehnungsregeln prüfen
+    for regel in c_regeln loop
+      v_regel_betrag := regel.r_betrag;
+      v_regel_alter := regel.r_alter;
+
+      -- Altersregel prüfen
+      v_alter_verletzt := false;
+      if v_regel_alter != '- -' then
+        if substr(v_regel_alter, 1, 1) = '<' then
+          v_alter_grenze := to_number(substr(v_regel_alter, 3));
+          v_alter_verletzt := (v_alter < v_alter_grenze);
+        elsif substr(v_regel_alter, 1, 1) = '>' then
+          v_alter_grenze := to_number(substr(v_regel_alter, 3));
+          v_alter_verletzt := (v_alter > v_alter_grenze);
+        end if;
+      end if;
+
+      -- Betragsregel prüfen
+      v_betrag_verletzt := false;
+      if v_regel_betrag != '- -' then
+        if substr(v_regel_betrag, 1, 2) = '>=' then
+          v_betrag_grenze := to_number(substr(v_regel_betrag, 3));
+          v_betrag_verletzt := (p_deckungsbetrag >= v_betrag_grenze);
+        elsif substr(v_regel_betrag, 1, 1) = '>' then
+          v_betrag_grenze := to_number(substr(v_regel_betrag, 2));
+          v_betrag_verletzt := (p_deckungsbetrag > v_betrag_grenze);
+        end if;
+      end if;
+
+      -- Regel verletzt, wenn Altersregel verletzt UND (keine Betragsregel ODER Betragsregel verletzt)
+      if v_alter_verletzt and (v_regel_betrag = '- -' or v_betrag_verletzt) then
+        raise_application_error(-20006, 'Deckungsart nicht regelkonform für Deckungsart: ' || p_deckungsart_id);
+      end if;
+    end loop;
+
+    -- 10. Deckung einfügen
+    insert into deckung (vertrag_fk, deckungsart_fk, deckungsbetrag)
+    values (p_vertrags_id, p_deckungsart_id, p_deckungsbetrag);
+
+  exception
+    when no_data_found then
+      raise_application_error(-20001, 'Dateninkonsistenz festgestellt');
+    when others then
+      -- Weiterleiten von benutzerdefinierten Exceptions
+      if sqlcode between -20007 and -20001 then
+        raise;
+      else
+        raise_application_error(-20001, 'Unerwarteter Fehler: ' || sqlerrm);
+      end if;
   end create_deckung;
 
 end versicherungsservice;
